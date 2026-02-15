@@ -123,6 +123,11 @@ impl PassthroughFs {
             _ => Operation::Read,
         }
     }
+
+    fn get_caller_executable(pid: u32) -> Option<PathBuf> {
+        let path = format!("/proc/{}/exe", pid);
+        std::fs::read_link(path).ok()
+    }
 }
 
 fn path_to_cstring(path: &Path) -> CString {
@@ -213,8 +218,15 @@ impl Filesystem for PassthroughFs {
         let virtual_p = self.source_dir.join(&rel);
         let op = Self::flags_to_operation(flags);
 
+        // Check if executable is excluded
+        let excluded = if let Some(exe) = Self::get_caller_executable(_req.pid()) {
+             self.rules.is_executable_excluded(&exe)
+        } else {
+             false
+        };
+
         // Check access rules
-        if self.rules.is_denied(&virtual_p, op) {
+        if !excluded && self.rules.is_denied(&virtual_p, op) {
             if let Ok(mut logger) = self.logger.lock() {
                 logger.log_denied(
                     _req.pid(),
@@ -471,18 +483,27 @@ impl Filesystem for PassthroughFs {
             }
         };
 
-        // Check deny rules
-        if mask & libc::R_OK != 0 && self.rules.is_denied(&virtual_p, Operation::Read) {
-            reply.error(libc::EACCES);
-            return;
-        }
-        if mask & libc::W_OK != 0 && self.rules.is_denied(&virtual_p, Operation::Write) {
-            reply.error(libc::EACCES);
-            return;
-        }
-        if mask & libc::X_OK != 0 && self.rules.is_denied(&virtual_p, Operation::Execute) {
-            reply.error(libc::EACCES);
-            return;
+        // Check if executable is excluded
+        let excluded = if let Some(exe) = Self::get_caller_executable(_req.pid()) {
+             self.rules.is_executable_excluded(&exe)
+        } else {
+             false
+        };
+
+        if !excluded {
+            // Check deny rules
+            if mask & libc::R_OK != 0 && self.rules.is_denied(&virtual_p, Operation::Read) {
+                reply.error(libc::EACCES);
+                return;
+            }
+            if mask & libc::W_OK != 0 && self.rules.is_denied(&virtual_p, Operation::Write) {
+                reply.error(libc::EACCES);
+                return;
+            }
+            if mask & libc::X_OK != 0 && self.rules.is_denied(&virtual_p, Operation::Execute) {
+                reply.error(libc::EACCES);
+                return;
+            }
         }
 
         // Check real filesystem access via faccessat

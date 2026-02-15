@@ -36,15 +36,42 @@ pub enum RuleParseError {
 #[derive(Debug)]
 pub struct AccessRules {
     rules: Vec<DenyRule>,
+    excluded_executables: Vec<PathPattern>,
 }
 
 impl AccessRules {
-    pub fn from_settings(settings: &Settings, cwd: &Path) -> Result<Self, RuleParseError> {
+    pub fn new(settings: &Settings, cwd: &Path, excluded_execs: Vec<String>) -> Result<Self, RuleParseError> {
         let mut rules = Vec::new();
         for entry in &settings.permissions.deny {
             rules.push(parse_deny_rule(entry, cwd)?);
         }
-        Ok(AccessRules { rules })
+
+        let mut excluded_executables = Vec::new();
+        // Treat excluded executables similar to deny rules but without operation prefix
+        for exec in excluded_execs {
+            let resolved = if exec.starts_with("./") || exec.starts_with("../") {
+                 let stripped = exec.strip_prefix("./").unwrap_or(&exec);
+                 cwd.join(stripped)
+            } else {
+                PathBuf::from(&exec)
+            };
+            
+            let resolved_str = resolved.to_string_lossy();
+            let has_glob = resolved_str.contains('*') || resolved_str.contains('?') || resolved_str.contains('[');
+
+            let pattern = if has_glob {
+                let match_opts = glob::MatchOptions {
+                    require_literal_leading_dot: false,
+                    ..Default::default()
+                };
+                PathPattern::Glob(Pattern::new(&resolved_str)?, match_opts)
+            } else {
+                PathPattern::Exact(resolved)
+            };
+            excluded_executables.push(pattern);
+        }
+
+        Ok(AccessRules { rules, excluded_executables })
     }
 
     /// Returns the unique set of paths referenced by deny rules.
@@ -69,6 +96,15 @@ impl AccessRules {
                 PathPattern::Glob(pattern, opts) => {
                     pattern.matches_with(&path.to_string_lossy(), *opts)
                 }
+            }
+        })
+    }
+
+    pub fn is_executable_excluded(&self, exe_path: &Path) -> bool {
+        self.excluded_executables.iter().any(|pattern| match pattern {
+            PathPattern::Exact(p) => exe_path == p,
+            PathPattern::Glob(pattern, opts) => {
+                pattern.matches_with(&exe_path.to_string_lossy(), *opts)
             }
         })
     }
@@ -139,7 +175,7 @@ mod tests {
     fn test_exact_read_denied() {
         let cwd = Path::new("/home/user/project");
         let settings = make_settings(vec!["Read(./a.txt)"]);
-        let rules = AccessRules::from_settings(&settings, cwd).unwrap();
+        let rules = AccessRules::new(&settings, cwd, vec![]).unwrap();
 
         assert!(rules.is_denied(Path::new("/home/user/project/a.txt"), Operation::Read));
         assert!(!rules.is_denied(Path::new("/home/user/project/b.txt"), Operation::Read));
@@ -149,7 +185,7 @@ mod tests {
     fn test_write_not_blocked_by_read_rule() {
         let cwd = Path::new("/home/user/project");
         let settings = make_settings(vec!["Read(./a.txt)"]);
-        let rules = AccessRules::from_settings(&settings, cwd).unwrap();
+        let rules = AccessRules::new(&settings, cwd, vec![]).unwrap();
 
         assert!(!rules.is_denied(Path::new("/home/user/project/a.txt"), Operation::Write));
     }
@@ -158,7 +194,7 @@ mod tests {
     fn test_glob_pattern() {
         let cwd = Path::new("/home/user/project");
         let settings = make_settings(vec!["Read(./*.env*)"]);
-        let rules = AccessRules::from_settings(&settings, cwd).unwrap();
+        let rules = AccessRules::new(&settings, cwd, vec![]).unwrap();
 
         assert!(rules.is_denied(Path::new("/home/user/project/.env"), Operation::Read));
         assert!(rules.is_denied(Path::new("/home/user/project/.env.local"), Operation::Read));
@@ -169,7 +205,7 @@ mod tests {
     fn test_write_operation() {
         let cwd = Path::new("/home/user/project");
         let settings = make_settings(vec!["Write(./secret.key)"]);
-        let rules = AccessRules::from_settings(&settings, cwd).unwrap();
+        let rules = AccessRules::new(&settings, cwd, vec![]).unwrap();
 
         assert!(rules.is_denied(Path::new("/home/user/project/secret.key"), Operation::Write));
         assert!(!rules.is_denied(Path::new("/home/user/project/secret.key"), Operation::Read));
@@ -179,7 +215,7 @@ mod tests {
     fn test_execute_operation() {
         let cwd = Path::new("/home/user/project");
         let settings = make_settings(vec!["Execute(./dangerous.sh)"]);
-        let rules = AccessRules::from_settings(&settings, cwd).unwrap();
+        let rules = AccessRules::new(&settings, cwd, vec![]).unwrap();
 
         assert!(rules.is_denied(
             Path::new("/home/user/project/dangerous.sh"),
@@ -191,21 +227,21 @@ mod tests {
     fn test_invalid_format() {
         let cwd = Path::new("/tmp");
         let settings = make_settings(vec!["invalid"]);
-        assert!(AccessRules::from_settings(&settings, cwd).is_err());
+        assert!(AccessRules::new(&settings, cwd, vec![]).is_err());
     }
 
     #[test]
     fn test_unknown_operation() {
         let cwd = Path::new("/tmp");
         let settings = make_settings(vec!["Delete(./file.txt)"]);
-        assert!(AccessRules::from_settings(&settings, cwd).is_err());
+        assert!(AccessRules::new(&settings, cwd, vec![]).is_err());
     }
 
     #[test]
     fn test_multiple_rules() {
         let cwd = Path::new("/home/user/project");
         let settings = make_settings(vec!["Read(./a.txt)", "Read(./.env)", "Write(./config.json)"]);
-        let rules = AccessRules::from_settings(&settings, cwd).unwrap();
+        let rules = AccessRules::new(&settings, cwd, vec![]).unwrap();
 
         assert!(rules.is_denied(Path::new("/home/user/project/a.txt"), Operation::Read));
         assert!(rules.is_denied(Path::new("/home/user/project/.env"), Operation::Read));
@@ -223,8 +259,26 @@ mod tests {
     fn test_absolute_path() {
         let cwd = Path::new("/tmp");
         let settings = make_settings(vec!["Read(/etc/passwd)"]);
-        let rules = AccessRules::from_settings(&settings, cwd).unwrap();
+        let rules = AccessRules::new(&settings, cwd, vec![]).unwrap();
 
         assert!(rules.is_denied(Path::new("/etc/passwd"), Operation::Read));
+    }
+
+    #[test]
+    fn test_executable_exclusion() {
+        let cwd = Path::new("/tmp");
+        let settings = Settings {
+            permissions: Permissions { deny: vec![] },
+        };
+        let rules = AccessRules::new(
+            &settings,
+            cwd,
+            vec!["/bin/cat".to_string(), "./myscript.sh".to_string()],
+        )
+        .unwrap();
+
+        assert!(rules.is_executable_excluded(Path::new("/bin/cat")));
+        assert!(rules.is_executable_excluded(Path::new("/tmp/myscript.sh")));
+        assert!(!rules.is_executable_excluded(Path::new("/bin/ls")));
     }
 }
