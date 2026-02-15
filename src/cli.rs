@@ -14,6 +14,10 @@ pub struct CliArgs {
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
 
+    /// Executable paths to exclude from access restrictions
+    #[arg(long, value_name = "PATH")]
+    pub exclude_exec: Vec<String>,
+
     /// Command and arguments to run under access restrictions
     #[arg(required = true, num_args = 1..)]
     pub command: Vec<String>,
@@ -77,5 +81,21 @@ mod tests {
         let args = CliArgs::parse_from(["fuse-access-guard", "ls", "-la"]);
         assert_eq!(args.command_name(), "ls");
         assert_eq!(args.command_args(), &["-la"]);
+    }
+
+    #[test]
+    fn test_parse_exclude_exec() {
+        let args = CliArgs::parse_from([
+            "fuse-access-guard",
+            "--exclude-exec",
+            "/bin/cat",
+            "--exclude-exec",
+            "/usr/bin/git",
+            "--",
+            "ls",
+        ]);
+        assert_eq!(args.exclude_exec.len(), 2);
+        assert_eq!(args.exclude_exec[0], "/bin/cat");
+        assert_eq!(args.exclude_exec[1], "/usr/bin/git");
     }
 }

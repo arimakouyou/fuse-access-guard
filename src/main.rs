@@ -27,7 +27,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let settings = config::load_settings(&cwd)?;
 
     // Build access rules
-    let rules = rules::AccessRules::from_settings(&settings, &cwd)?;
+    let rules = rules::AccessRules::new(&settings, &cwd, args.exclude_exec.clone())?;
     let rules = Arc::new(rules);
 
     // Set up logger
